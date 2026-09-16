@@ -1,10 +1,14 @@
+//go:build cgo
+
 package cwebp
 
 /*
-#cgo pkg-config: libwebp libwebpmux
+#cgo pkg-config: libwebp libwebpmux libwebpdemux
 #include <stdlib.h>
 #include <webp/encode.h>
 #include <webp/mux.h>
+#include <webp/decode.h>
+#include <webp/demux.h>
 */
 import "C"
 
@@ -13,20 +17,9 @@ import (
 	"image"
 	"image/draw"
 	"io"
+	"runtime"
 	"unsafe"
 )
-
-type Options struct {
-	Lossless bool
-	Quality  float32
-	Method   int
-}
-
-type Webp struct {
-	Frames    []image.Image
-	Delays    []int
-	LoopCount int
-}
 
 func Encode(w io.Writer, m image.Image, o *Options) error {
 	cfg, err := buildConfig(o)
@@ -107,6 +100,122 @@ func EncodeAll(w io.Writer, a *Webp, o *Options) error {
 
 	_, err = w.Write(C.GoBytes(unsafe.Pointer(data.bytes), C.int(data.size)))
 	return err
+}
+
+func Decode(r io.Reader) (image.Image, error) {
+	data, err := io.ReadAll(r)
+	if err != nil {
+		return nil, err
+	}
+	if len(data) == 0 {
+		return nil, fmt.Errorf("%w: empty input", ErrDecodeFailed)
+	}
+
+	var width, height C.int
+
+	buf := C.WebPDecodeRGBA(
+		(*C.uint8_t)(unsafe.Pointer(&data[0])),
+		C.size_t(len(data)),
+		&width,
+		&height,
+	)
+	if buf == nil {
+		return nil, fmt.Errorf("%w", ErrDecodeFailed)
+	}
+	defer C.WebPFree(unsafe.Pointer(buf))
+
+	w := int(width)
+	h := int(height)
+	if w <= 0 || h <= 0 {
+		return nil, fmt.Errorf("%w: invalid dimensions (%d,%d)", ErrDecodeFailed, w, h)
+	}
+
+	size := w * h * 4
+	pix := C.GoBytes(unsafe.Pointer(buf), C.int(size))
+
+	return &image.RGBA{
+		Pix:    pix,
+		Stride: w * 4,
+		Rect:   image.Rect(0, 0, w, h),
+	}, nil
+}
+
+func DecodeAll(r io.Reader) (*Webp, error) {
+	data, err := io.ReadAll(r)
+	if err != nil {
+		return nil, err
+	}
+	if len(data) == 0 {
+		return nil, fmt.Errorf("%w: empty input", ErrDecodeFailed)
+	}
+
+	var pinner runtime.Pinner
+	pinner.Pin(&data[0])
+	defer pinner.Unpin()
+
+	webpData := C.WebPData{
+		bytes: (*C.uint8_t)(unsafe.Pointer(&data[0])),
+		size:  C.size_t(len(data)),
+	}
+
+	var opts C.WebPAnimDecoderOptions
+	if C.WebPAnimDecoderOptionsInit(&opts) == 0 {
+		return nil, ErrAnimationDecoderOptionsInitFailed
+	}
+	opts.color_mode = C.MODE_RGBA
+	opts.use_threads = 1
+
+	dec := C.WebPAnimDecoderNew(&webpData, &opts)
+	if dec == nil {
+		return nil, ErrDecodeFailed
+	}
+	defer C.WebPAnimDecoderDelete(dec)
+
+	var info C.WebPAnimInfo
+	if C.WebPAnimDecoderGetInfo(dec, &info) == 0 {
+		return nil, fmt.Errorf("%w: failed to read animation info", ErrDecodeFailed)
+	}
+
+	width := int(info.canvas_width)
+	height := int(info.canvas_height)
+	if width <= 0 || height <= 0 {
+		return nil, fmt.Errorf("%w: invalid canvas dimensions (%d,%d)", ErrDecodeFailed, width, height)
+	}
+
+	result := &Webp{
+		Frames:    make([]image.Image, 0, int(info.frame_count)),
+		Delays:    make([]int, 0, int(info.frame_count)),
+		LoopCount: int(info.loop_count),
+	}
+
+	var previousTimestamp int
+	for C.WebPAnimDecoderHasMoreFrames(dec) != 0 {
+		var buf *C.uint8_t
+		var timestamp C.int
+
+		if C.WebPAnimDecoderGetNext(dec, &buf, &timestamp) == 0 {
+			return nil, fmt.Errorf("%w: failed decoding frame %d", ErrDecodeFailed, len(result.Frames))
+		}
+
+		size := width * height * 4
+		pix := C.GoBytes(unsafe.Pointer(buf), C.int(size))
+
+		frame := &image.RGBA{
+			Pix:    pix,
+			Stride: width * 4,
+			Rect:   image.Rect(0, 0, width, height),
+		}
+
+		ts := int(timestamp)
+		result.Frames = append(result.Frames, frame)
+		result.Delays = append(result.Delays, ts-previousTimestamp)
+		previousTimestamp = ts
+	}
+
+	if len(result.Frames) == 0 {
+		return nil, fmt.Errorf("%w: no frames", ErrDecodeFailed)
+	}
+	return result, nil
 }
 
 func encodeFrame(
